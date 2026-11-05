@@ -11,7 +11,13 @@ import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.os.Looper
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
@@ -45,8 +51,55 @@ class HidGamepadService : Service() {
     private var adapter: BluetoothAdapter? = null
     private var hidDevice: BluetoothHidDevice? = null
     private var connectedDevice: BluetoothDevice? = null
-    private var registered = false
-    private var proxyReady = false
+    @Volatile private var registered = false
+    @Volatile private var proxyReady = false
+    @Volatile private var proxyRequested = false
+    @Volatile private var registerPending = false
+    private var registerAttempts = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var btReceiverRegistered = false
+
+    private val proxyTimeout = Runnable {
+        if (!proxyReady) {
+            proxyRequested = false
+            publish(HidStatus.Error(
+                "HID profile unavailable: Bluetooth HID Device service never connected. " +
+                    "This phone's firmware may not support acting as a HID device " +
+                    "(seen on some Samsung/older Android builds). Try toggling Bluetooth and retry."))
+        }
+    }
+
+    private val registerTimeout = Runnable {
+        if (registerPending && !registered) {
+            registerPending = false
+            if (registerAttempts < MAX_REGISTER_ATTEMPTS) {
+                Log.w(TAG, "registerApp: no onAppStatusChanged, retrying")
+                publish(HidStatus.Registering("No reply from Bluetooth stack, retrying (${registerAttempts + 1}/$MAX_REGISTER_ATTEMPTS)…"))
+                try { hidDevice?.unregisterApp() } catch (_: Throwable) {}
+                mainHandler.postDelayed({ registerAppInternal() }, 500)
+            } else {
+                publish(HidStatus.Error(
+                    "Registration timed out: registerApp was accepted but the Bluetooth stack never " +
+                        "confirmed (onAppStatusChanged). Toggle Bluetooth off/on, close other gamepad/keyboard " +
+                        "emulator apps, then retry."))
+            }
+        }
+    }
+
+    private val btStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF -> {
+                    mainHandler.removeCallbacks(proxyTimeout)
+                    mainHandler.removeCallbacks(registerTimeout)
+                    registered = false
+                    registerPending = false
+                    connectedDevice = null
+                    publish(HidStatus.BluetoothOff)
+                }
+            }
+        }
+    }
 
     private val callbackExecutor = Executors.newSingleThreadExecutor()
     private var sendThread: HandlerThread? = null
@@ -57,7 +110,9 @@ class HidGamepadService : Service() {
             if (profile != BluetoothProfile.HID_DEVICE || proxy !is BluetoothHidDevice) return
             hidDevice = proxy
             proxyReady = true
+            mainHandler.removeCallbacks(proxyTimeout)
             Log.i(TAG, "HID_DEVICE proxy connected")
+            registerAttempts = 0
             registerAppInternal()
         }
 
@@ -66,16 +121,21 @@ class HidGamepadService : Service() {
             Log.w(TAG, "HID_DEVICE proxy disconnected")
             hidDevice = null
             proxyReady = false
+            proxyRequested = false
             registered = false
+            registerPending = false
             connectedDevice = null
-            publish(HidStatus.Error("HID service disconnected"))
+            publish(HidStatus.Error("HID profile service disconnected (Bluetooth restarted?). Tap Start gamepad to retry."))
         }
     }
 
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, isRegistered: Boolean) {
             Log.i(TAG, "onAppStatusChanged registered=$isRegistered plugged=${pluggedDevice?.address}")
+            val wasPending = registerPending
             registered = isRegistered
+            registerPending = false
+            mainHandler.removeCallbacks(registerTimeout)
             if (isRegistered) {
                 val host = connectedDevice
                 if (host != null) {
@@ -85,7 +145,13 @@ class HidGamepadService : Service() {
                 }
             } else {
                 connectedDevice = null
-                publish(HidStatus.Idle)
+                if (wasPending) {
+                    publish(HidStatus.Error(
+                        "Bluetooth stack rejected HID registration (onAppStatusChanged=false). " +
+                            "Another app may already be registered as a HID device; close it or toggle Bluetooth."))
+                } else {
+                    publish(HidStatus.Idle)
+                }
             }
         }
 
@@ -122,6 +188,8 @@ class HidGamepadService : Service() {
             it.start()
             sendHandler = Handler(it.looper)
         }
+        androidx.core.content.ContextCompat.registerReceiver(this, btStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
+        btReceiverRegistered = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -130,6 +198,8 @@ class HidGamepadService : Service() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
+        if (btReceiverRegistered) { try { unregisterReceiver(btStateReceiver) } catch (_: Throwable) {} }
         unregisterApp()
         adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
         hidDevice = null
@@ -169,21 +239,53 @@ class HidGamepadService : Service() {
             publish(HidStatus.Unsupported)
             return
         }
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            publish(HidStatus.PermissionRequired)
+            return
+        }
         if (!a.isEnabled) {
             publish(HidStatus.BluetoothOff)
             return
         }
-        // Probe profile availability
+        GenericHidProfile.validateDescriptor()?.let {
+            publish(HidStatus.Error("Internal HID descriptor invalid: $it"))
+            return
+        }
+        if (registered) {
+            val host = connectedDevice
+            publish(if (host != null) HidStatus.Connected(hostName(host), host.address) else HidStatus.Ready)
+            return
+        }
+        // Proxy already connected: just (re)register instead of leaking another proxy.
+        if (hidDevice != null && proxyReady) {
+            registerAttempts = 0
+            registerAppInternal()
+            return
+        }
+        if (proxyRequested) {
+            Log.i(TAG, "startHid: proxy request already in flight")
+            return
+        }
         try {
-            // getProfileProxy returns false if profile unsupported
-            publish(HidStatus.Registering)
+            publish(HidStatus.Registering("Connecting to Bluetooth HID Device profile…"))
+            proxyRequested = true
             val ok = a.getProfileProxy(this, profileListener, BluetoothProfile.HID_DEVICE)
             if (!ok) {
-                publish(HidStatus.Unsupported)
+                proxyRequested = false
+                publish(HidStatus.Error("HID profile unavailable: getProfileProxy(HID_DEVICE) returned false"))
+            } else {
+                mainHandler.removeCallbacks(proxyTimeout)
+                mainHandler.postDelayed(proxyTimeout, PROXY_TIMEOUT_MS)
             }
+        } catch (sec: SecurityException) {
+            proxyRequested = false
+            publish(HidStatus.PermissionRequired)
         } catch (t: Throwable) {
+            proxyRequested = false
             Log.e(TAG, "getProfileProxy failed", t)
-            publish(HidStatus.Unsupported)
+            publish(HidStatus.Error("HID profile unavailable: ${t.javaClass.simpleName}: ${t.message}"))
         }
     }
 
@@ -192,6 +294,10 @@ class HidGamepadService : Service() {
         adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
         hidDevice = null
         proxyReady = false
+        proxyRequested = false
+        registerPending = false
+        mainHandler.removeCallbacks(proxyTimeout)
+        mainHandler.removeCallbacks(registerTimeout)
         connectedDevice = null
         publish(HidStatus.Idle)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -220,6 +326,11 @@ class HidGamepadService : Service() {
             publish(HidStatus.Ready)
             return
         }
+        if (registerPending) {
+            Log.i(TAG, "registerApp already pending; ignoring duplicate call")
+            return
+        }
+        registerAttempts++
         try {
             val sdp = BluetoothHidDeviceAppSdpSettings(
                 GenericHidProfile.SDP_NAME,
@@ -228,16 +339,35 @@ class HidGamepadService : Service() {
                 GenericHidProfile.SUBCLASS,
                 GenericHidProfile.descriptor,
             )
+            publish(HidStatus.Registering("Registering HID app with Bluetooth stack…"))
+            registerPending = true
             val ok = hid.registerApp(sdp, null, null, callbackExecutor, hidCallback)
-            Log.i(TAG, "registerApp sent=$ok")
-            if (!ok) publish(HidStatus.Error("registerApp returned false"))
-            // Actual Ready comes from onAppStatusChanged
+            Log.i(TAG, "registerApp sent=$ok attempt=$registerAttempts")
+            if (ok) {
+                // Actual Ready comes from onAppStatusChanged; guard against it never arriving.
+                mainHandler.removeCallbacks(registerTimeout)
+                mainHandler.postDelayed(registerTimeout, REGISTER_TIMEOUT_MS)
+            } else {
+                registerPending = false
+                if (registerAttempts < MAX_REGISTER_ATTEMPTS) {
+                    // Often means a stale registration from a previous run; clear and retry once.
+                    publish(HidStatus.Registering("registerApp returned false, clearing stale registration and retrying…"))
+                    try { hid.unregisterApp() } catch (_: Throwable) {}
+                    mainHandler.postDelayed({ registerAppInternal() }, 700)
+                } else {
+                    publish(HidStatus.Error(
+                        "registerApp returned false. Another app may hold the HID device slot, " +
+                            "or this firmware rejects HID device apps. Toggle Bluetooth and retry."))
+                }
+            }
         } catch (sec: SecurityException) {
+            registerPending = false
             Log.e(TAG, "registerApp permission", sec)
             publish(HidStatus.PermissionRequired)
         } catch (t: Throwable) {
+            registerPending = false
             Log.e(TAG, "registerApp failed", t)
-            publish(HidStatus.Error(t.message ?: "registerApp failed"))
+            publish(HidStatus.Error("registerApp threw ${t.javaClass.simpleName}: ${t.message}"))
         }
     }
 
@@ -332,6 +462,9 @@ class HidGamepadService : Service() {
         private const val TAG = "PhonePadHID"
         private const val NOTIF_ID = 42
         private const val MIN_SEND_GAP_MS = 10L
+        private const val PROXY_TIMEOUT_MS = 5000L
+        private const val REGISTER_TIMEOUT_MS = 6000L
+        private const val MAX_REGISTER_ATTEMPTS = 2
     }
 }
 

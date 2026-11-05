@@ -34,6 +34,9 @@ class MainActivity : AppCompatActivity() {
 
     private var service: HidGamepadService? = null
     private var bound = false
+    private var pendingStart = false
+    private var permissionAskedOnce = false
+    private var shownStatus: HidStatus = HidStatus.Idle
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -41,6 +44,7 @@ class MainActivity : AppCompatActivity() {
         if (result.values.all { it }) {
             maybeStartService()
         } else {
+            permissionAskedOnce = true
             applyStatus(HidStatus.PermissionRequired)
         }
     }
@@ -63,13 +67,11 @@ class MainActivity : AppCompatActivity() {
             bound = true
             svc.addStatusListener(statusListener)
             gamepad.listener = GamepadView.Listener { state -> svc.updateState(state) }
-            // Auto-register once bound if BT is on and we already hold permissions
-            if (hasBtPermissions() && bluetoothAdapter()?.isEnabled == true) {
-                ContextCompat.startForegroundService(
-                    this@MainActivity,
-                    Intent(this@MainActivity, HidGamepadService::class.java),
-                )
-                svc.startHid()
+            // Start only if a start was requested before bind completed (or auto-start
+            // when permissions + BT are already OK). Service de-duplicates concurrent starts.
+            if (pendingStart || (hasBtPermissions() && bluetoothAdapter()?.isEnabled == true)) {
+                pendingStart = false
+                maybeStartService()
             }
         }
 
@@ -131,25 +133,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun ensurePermissionsThenStart() {
-        val needed = mutableListOf<String>()
+    private fun requiredPermissions(): List<String> =
         if (Build.VERSION.SDK_INT >= 31) {
-            listOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_SCAN,
-            ).forEach {
-                if (ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED) {
-                    needed.add(it)
-                }
-            }
+            // CONNECT is needed for registerApp/connect/sendReport; ADVERTISE for discoverable.
+            listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
         } else {
-            // Pre-31: location sometimes required for BT discovery on older stacks
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
+            // Android 9–11: BLUETOOTH/BLUETOOTH_ADMIN are install-time permissions.
+            // Location is NOT needed to act as a HID device, so we no longer block on it.
+            emptyList()
+        }
+
+    private fun ensurePermissionsThenStart() {
+        val needed = requiredPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
         if (needed.isNotEmpty()) {
             applyStatus(HidStatus.PermissionRequired)
@@ -165,27 +161,42 @@ class MainActivity : AppCompatActivity() {
             applyStatus(HidStatus.Unsupported)
             return
         }
+        if (!hasBtPermissions()) {
+            applyStatus(HidStatus.PermissionRequired)
+            return
+        }
         if (!adapter.isEnabled) {
             applyStatus(HidStatus.BluetoothOff)
             return
         }
-        // Start FGS then ask it to register
-        val intent = Intent(this, HidGamepadService::class.java)
-        ContextCompat.startForegroundService(this, intent)
-        // Service may already be bound
-        service?.startHid() ?: run {
-            // briefly wait for bind — startHid called again from onServiceConnected via Idle→user
-            // Auto-start once connected:
-            // Handled by posting after a short delay if service not yet bound
-            statusText.postDelayed({
-                service?.startHid()
-            }, 300)
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, HidGamepadService::class.java))
+        } catch (t: Throwable) {
+            applyStatus(HidStatus.Error("Could not start gamepad service: ${t.javaClass.simpleName}: ${t.message}"))
+            return
+        }
+        val svc = service
+        if (svc != null) {
+            svc.startHid()
+        } else {
+            pendingStart = true
+            applyStatus(HidStatus.Registering("Starting gamepad service…"))
         }
     }
 
     private fun onPrimary() {
-        when (service?.currentStatus() ?: HidStatus.Idle) {
-            is HidStatus.PermissionRequired -> ensurePermissionsThenStart()
+        when (shownStatus) {
+            is HidStatus.PermissionRequired -> {
+                if (Build.VERSION.SDK_INT >= 31 && requiredPermissions().any { !shouldShowRequestPermissionRationale(it) } &&
+                    !hasBtPermissions() && permissionAskedOnce
+                ) {
+                    // Permanently denied: send to app settings.
+                    startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.fromParts("package", packageName, null)))
+                } else {
+                    ensurePermissionsThenStart()
+                }
+            }
             is HidStatus.BluetoothOff -> {
                 enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             }
@@ -200,7 +211,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onSecondary() {
-        when (service?.currentStatus()) {
+        when (shownStatus) {
             is HidStatus.Ready, is HidStatus.Connected, is HidStatus.Registering -> {
                 service?.stopHid()
                 applyStatus(HidStatus.Idle)
@@ -221,6 +232,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyStatus(status: HidStatus) {
+        shownStatus = status
         hostText.text = getString(R.string.host_none)
         pairingPanel.visibility = View.VISIBLE
         when (status) {
@@ -254,7 +266,7 @@ class MainActivity : AppCompatActivity() {
                 btnSecondary.isEnabled = true
             }
             is HidStatus.Registering -> {
-                statusText.text = getString(R.string.status_registering)
+                statusText.text = status.step.ifBlank { getString(R.string.status_registering) }
                 statusText.setTextColor(ContextCompat.getColor(this, R.color.warn))
                 btnPrimary.isEnabled = false
                 btnSecondary.isEnabled = false
@@ -277,7 +289,7 @@ class MainActivity : AppCompatActivity() {
                 btnSecondary.isEnabled = true
             }
             is HidStatus.Error -> {
-                statusText.text = status.message
+                statusText.text = "Error: ${status.message}"
                 statusText.setTextColor(ContextCompat.getColor(this, R.color.err))
                 btnPrimary.text = getString(R.string.btn_register)
                 btnPrimary.isEnabled = true
@@ -287,14 +299,8 @@ class MainActivity : AppCompatActivity() {
     }
 
 
-    private fun hasBtPermissions(): Boolean {
-        return if (Build.VERSION.SDK_INT >= 31) {
-            listOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_SCAN,
-            ).all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
-        } else true
+    private fun hasBtPermissions(): Boolean = requiredPermissions().all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun bluetoothAdapter(): BluetoothAdapter? =

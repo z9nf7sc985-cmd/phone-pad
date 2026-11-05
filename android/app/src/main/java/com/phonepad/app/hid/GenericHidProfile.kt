@@ -70,7 +70,8 @@ object GenericHidProfile {
         0x75, 0x04,
         0x95.toByte(), 0x01,
         0x81.toByte(), 0x42,    // Input Null State
-        0x65, 0x00,
+        0x65, 0x00,             // Unit (None)
+        0x45, 0x00,             // Physical Max 0 (reset so it does not leak into buttons)
         0x75, 0x04,
         0x95.toByte(), 0x01,
         0x81.toByte(), 0x03,    // Constant pad
@@ -104,5 +105,49 @@ object GenericHidProfile {
             (buttons and 0xFF).toByte(),
             ((buttons shr 8) and 0xFF).toByte(),
         )
+    }
+
+    /**
+     * Minimal structural validation of a HID report descriptor (short items only).
+     * Returns null if OK, else a human-readable reason. Checks: item lengths fit,
+     * collections balanced, no long items, every Input has non-zero size/count,
+     * and total input bits for [reportId] equal [expectedBytes]*8.
+     */
+    fun validateDescriptor(
+        d: ByteArray = descriptor,
+        reportId: Int = REPORT_ID,
+        expectedBytes: Int = REPORT_SIZE,
+    ): String? {
+        var i = 0
+        var depth = 0
+        var reportSize = 0
+        var reportCount = 0
+        var currentId = 0
+        val bits = HashMap<Int, Int>()
+        while (i < d.size) {
+            val prefix = d[i].toInt() and 0xFF
+            if (prefix == 0xFE) return "long items not supported (offset $i)"
+            val len = when (prefix and 0x03) { 3 -> 4; else -> prefix and 0x03 }
+            if (i + len >= d.size) return "truncated item at offset $i"
+            var v = 0
+            for (k in 0 until len) v = v or ((d[i + 1 + k].toInt() and 0xFF) shl (8 * k))
+            when (prefix and 0xFC) {
+                0xA0 -> depth++
+                0xC0 -> { depth--; if (depth < 0) return "End Collection without Collection (offset $i)" }
+                0x74 -> reportSize = v
+                0x94 -> reportCount = v
+                0x84 -> { if (v == 0) return "Report ID 0 is reserved"; currentId = v }
+                0x80 -> {
+                    if (reportSize == 0 || reportCount == 0) return "Input with zero size/count (offset $i)"
+                    bits[currentId] = (bits[currentId] ?: 0) + reportSize * reportCount
+                }
+            }
+            i += 1 + len
+        }
+        if (depth != 0) return "unbalanced collections (depth=$depth)"
+        val b = bits[reportId] ?: return "no Input items for report ID $reportId"
+        if (b % 8 != 0) return "report $reportId input is $b bits, not byte aligned"
+        if (b / 8 != expectedBytes) return "report $reportId is ${b / 8} bytes, encoder sends $expectedBytes"
+        return null
     }
 }
