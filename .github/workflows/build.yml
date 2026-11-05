@@ -1,0 +1,93 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK cmdline-tools
+        run: |
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL -o /tmp/cmdtools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdtools.zip -d "$HOME/android-sdk/cmdline-tools"
+          mv "$HOME/android-sdk/cmdline-tools/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$HOME/android-sdk/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Accept licenses and install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Write local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --stacktrace
+
+      - name: Package release assets
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk PhonePad-v0.1.0.apk
+          sha256sum PhonePad-v0.1.0.apk | tee PhonePad-v0.1.0.apk.sha256
+          $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose --min-sdk-version 23 PhonePad-v0.1.0.apk | tee apksigner.txt
+          $ANDROID_HOME/build-tools/34.0.0/aapt dump badging PhonePad-v0.1.0.apk | head -5 | tee badging.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhonePad-debug
+          path: |
+            PhonePad-v0.1.0.apk
+            PhonePad-v0.1.0.apk.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub Release v0.1.0
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: PhonePad v0.1.0
+          body: |
+            Android app that makes the phone act as a Bluetooth gamepad (Xbox-style sticks, triggers, d-pad, 16 buttons).
+
+            **Honest caveat:** whether an iPhone treats it as a game controller is untested and may fail.
+
+            **Test steps**
+            1. Grant Bluetooth permissions
+            2. Tap **Ready**
+            3. Tap **Make discoverable**
+            4. Pair from the iPhone (Forget Device first if paired before)
+
+            Package: `com.phonepad.app` · versionCode 1 · versionName 0.1.0-debug · minSdk 28 · targetSdk 34
+            Signed with APK Signature Scheme v1 + v2 + v3.
+          files: |
+            PhonePad-v0.1.0.apk
+            PhonePad-v0.1.0.apk.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

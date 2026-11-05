@@ -1,0 +1,4 @@
+PhonePad v0.1.0-debug
+Signed APK: dist/PhonePad-v0.1.0.apk (v1+v2+v3)
+applicationId: com.phonepad.app
+Published via GitHub Actions release tag v0.1.0
