@@ -55,4 +55,16 @@ class GenericHidProfileTest {
         }
         assertTrue(found)
     }
+
+    @Test
+    fun descriptor_is_structurally_valid_and_matches_report_size() {
+        assertEquals(null, GenericHidProfile.validateDescriptor())
+    }
+
+    @Test
+    fun validator_rejects_unbalanced_and_truncated() {
+        val d = GenericHidProfile.descriptor
+        assertTrue(GenericHidProfile.validateDescriptor(d.copyOf(d.size - 1)) != null)
+        assertTrue(GenericHidProfile.validateDescriptor(d.copyOf(d.size - 2) + byteArrayOf(0x26)) != null)
+    }
 }
