@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhonePad</string>
+    <string name="status_idle">Bluetooth ready — register HID</string>
+    <string name="status_registering">Registering as gamepad…</string>
+    <string name="status_ready">Ready to pair — make discoverable</string>
+    <string name="status_connected">Connected to %1$s</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_bt_off">Bluetooth is off</string>
+    <string name="status_no_support">HID Device profile not supported on this phone</string>
+    <string name="status_need_permission">Nearby devices permission required</string>
+    <string name="btn_register">Start gamepad</string>
+    <string name="btn_discoverable">Make discoverable</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_grant">Grant permission</string>
+    <string name="host_none">No host connected</string>
+    <string name="pairing_hint">On iPhone: Settings → Bluetooth → tap this phone\'s name. Pair while HID is registered. If previously paired as a phone, Forget Device first.</string>
+    <string name="notification_title">PhonePad gamepad</string>
+    <string name="notification_text">Advertising as Bluetooth HID gamepad</string>
+    <string name="channel_name">Gamepad service</string>
+</resources>

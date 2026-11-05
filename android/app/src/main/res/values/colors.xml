@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF0B0F14</color>
+    <color name="panel">#FF161B22</color>
+    <color name="resting">#FF2A3340</color>
+    <color name="pressed">#FF4C82F7</color>
+    <color name="accent_a">#FF3DDC84</color>
+    <color name="accent_b">#FFE85D5D</color>
+    <color name="accent_x">#FF5B9BFF</color>
+    <color name="accent_y">#FFF0C14A</color>
+    <color name="text">#FFF2F5F8</color>
+    <color name="text_dim">#FF9AA7B5</color>
+    <color name="ok">#FF3DDC84</color>
+    <color name="warn">#FFF0C14A</color>
+    <color name="err">#FFE85D5D</color>
+    <color name="stick_well">#FF1A222C</color>
+    <color name="stick_knob">#FFD8DEE6</color>
+    <color name="outline">#FF4A5564</color>
+</resources>
